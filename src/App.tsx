@@ -174,6 +174,7 @@ export default function App() {
   const [L, setL] = useState(0);
   const [R, setR] = useState(0);
   const [winner, setWinner] = useState<WinnerSide>(null);
+  const [flashingSide, setFlashingSide] = useState<WinnerSide>(null);
 
   const [showReset, setShowReset] = useState(false);
   const [showSettings, setShowSettings] = useState(!hasSaved);
@@ -188,6 +189,7 @@ export default function App() {
   const LONG_PRESS_MS = 900;
   const lpTimerRef = useRef<number | null>(null);
   const suppressTapRef = useRef(false);
+  const flashTimerRef = useRef<number | null>(null);
 
   const ruleBadge = useMemo(
     () => `目標${rules.target} / デュース${rules.deuce ? "あり" : "なし"}`,
@@ -206,16 +208,20 @@ export default function App() {
     setL(0);
     setR(0);
     setWinner(null);
+    setFlashingSide(null);
+    if (flashTimerRef.current) {
+      window.clearTimeout(flashTimerRef.current);
+      flashTimerRef.current = null;
+    }
   };
 
   const flashSide = (side: "L" | "R") => {
-    const el = document.getElementById(side === "L" ? "halfL" : "halfR");
-    if (!el) return;
-    el.classList.remove("winflash");
-    const forceReflow = (el as HTMLElement).offsetWidth;
-    void forceReflow;
-    el.classList.add("winflash");
-    window.setTimeout(() => el.classList.remove("winflash"), 3800);
+    setFlashingSide(side);
+    if (flashTimerRef.current) window.clearTimeout(flashTimerRef.current);
+    flashTimerRef.current = window.setTimeout(() => {
+      setFlashingSide((current) => (current === side ? null : current));
+      flashTimerRef.current = null;
+    }, 3800);
   };
 
   const celebrate = async (side: "L" | "R") => {
@@ -238,6 +244,15 @@ export default function App() {
       setWinner(null);
     }
   }, [L, R, rules]);
+
+  useEffect(
+    () => () => {
+      if (flashTimerRef.current) {
+        window.clearTimeout(flashTimerRef.current);
+      }
+    },
+    []
+  );
 
   // helpers
   const incLeft = () => {
@@ -357,7 +372,9 @@ export default function App() {
       <div style={styles.scoreArea}>
         <div
           id="halfL"
-          className={winner === "L" ? "winsteady" : undefined}
+          className={
+            flashingSide === "L" ? "winflash" : winner === "L" ? "winsteady" : undefined
+          }
           style={{
             ...styles.half,
             borderRight: "2px solid rgba(255,255,255,0.07)",
@@ -375,7 +392,9 @@ export default function App() {
 
         <div
           id="halfR"
-          className={winner === "R" ? "winsteady" : undefined}
+          className={
+            flashingSide === "R" ? "winflash" : winner === "R" ? "winsteady" : undefined
+          }
           style={styles.half}
           {...halfRHandlers}
         >
