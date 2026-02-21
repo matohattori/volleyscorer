@@ -344,12 +344,20 @@ export default function App() {
             animation: winFlash 0.35s linear 0s 10;
             pointer-events: none;
           }
+          .winsteady::before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: rgba(0,255,130,.22);
+            pointer-events: none;
+          }
         `}
       </style>
 
       <div style={styles.scoreArea}>
         <div
           id="halfL"
+          className={winner === "L" ? "winsteady" : undefined}
           style={{
             ...styles.half,
             borderRight: "2px solid rgba(255,255,255,0.07)",
@@ -365,7 +373,12 @@ export default function App() {
           </div>
         </div>
 
-        <div id="halfR" style={styles.half} {...halfRHandlers}>
+        <div
+          id="halfR"
+          className={winner === "R" ? "winsteady" : undefined}
+          style={styles.half}
+          {...halfRHandlers}
+        >
           <div style={styles.label}>RIGHT</div>
           {winner === "R" && <div style={styles.winTag}>WIN</div>}
           <div style={styles.score}>{R}</div>
