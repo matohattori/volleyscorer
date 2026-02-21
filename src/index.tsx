@@ -1,6 +1,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
+import "./styles.css";
 
 const container = document.getElementById("root");
 if (container) {
@@ -11,6 +12,8 @@ if (container) {
     </React.StrictMode>
   );
 }
+
+// (任意) PWA/Service Worker を使っていないなら、このブロックは削除してOK
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => {
     navigator.serviceWorker
