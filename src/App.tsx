@@ -1,427 +1,680 @@
-// App.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
-export default function JengaTimer() {
-  const [numPlayers, setNumPlayers] = useState(2);
-  const [timePerTurn, setTimePerTurn] = useState(10);
-  const [currentPlayer, setCurrentPlayer] = useState(0);
-  const [running, setRunning] = useState(false);
-  const [gameOver, setGameOver] = useState(false);
-  const [started, setStarted] = useState(false);
-  const [flash, setFlash] = useState(false);
-  
-  // Check if infinite time mode is enabled
-  const isInfiniteTime = timePerTurn === Infinity;
+type WinnerSide = "L" | "R" | null;
 
-  // ★ 追加: 色選択モード＆背景色
-  const [colorMode, setColorMode] = useState(false);
-  const [bgColor, setBgColor] = useState<string | undefined>(undefined);
-  const colorPool = useRef<string[]>([
-    "red",
-    "blue",
-    "brown",
-    "green",
-    "yellow",
-    "orange",
-  ]);
+type Rules = {
+  target: number; // 1..99
+  deuce: boolean; // true => 2点差が必要
+};
 
-  const deadlineRef = useRef<number | null>(null);
-  const [remainingMs, setRemainingMs] = useState(0);
-  const [playerNames, setPlayerNames] = useState([
-    "Player 1",
-    "Player 2",
-    "Player 3",
-    "Player 4",
-  ]);
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const [audioPrimed, setAudioPrimed] = useState(false);
-  const audioLockRef = useRef(false);
-  const lastSecondRef = useRef<number | null>(null);
+const LS_TARGET = "vc_targetPoints";
+const LS_DEUCE = "vc_deuceEnabled";
 
-  const ceilSecs = (ms: number) => Math.max(0, Math.ceil(ms / 1000));
-  const nextIdx = (p: number, n: number) => (p + 1) % n;
-  const remainingSec = useMemo(() => ceilSecs(remainingMs), [remainingMs]);
+function clampInt(n: number, min: number, max: number) {
+  const x = Math.floor(n);
+  return Math.min(max, Math.max(min, x));
+}
 
-  // ★ 追加: ランダム色選択
-  const pickRandomColor = () => {
-    const arr = colorPool.current;
-    const idx = Math.floor(Math.random() * arr.length);
-    return arr[idx];
-    // Reactのinline styleで背景色を安全に指定できます。:contentReference[oaicite:1]{index=1}
+function loadRules(): { rules: Rules; hasSaved: boolean } {
+  const rawT = localStorage.getItem(LS_TARGET);
+  const rawD = localStorage.getItem(LS_DEUCE);
+
+  const t = Number(rawT);
+  const target = Number.isFinite(t) ? clampInt(t, 1, 99) : 25;
+  const deuce = rawD === "true" ? true : rawD === "false" ? false : true;
+
+  return {
+    rules: { target, deuce },
+    hasSaved: rawT !== null || rawD !== null,
   };
+}
 
-  const ensureAudioPrimed = () => {
-    if (audioPrimed) return;
-    try {
-      const AudioCtx =
-        window.AudioContext || (window as any).webkitAudioContext;
-      const ctx = new AudioCtx();
-      audioCtxRef.current = ctx;
-      const silent = ctx.createBuffer(1, 1, ctx.sampleRate);
-      const src = ctx.createBufferSource();
-      src.buffer = silent;
-      src.connect(ctx.destination);
-      src.start();
-      ctx
-        .resume()
-        .then(() => setAudioPrimed(true))
-        .catch(() => {});
-    } catch (_) {}
-  };
+function saveRules(r: Rules) {
+  localStorage.setItem(LS_TARGET, String(r.target));
+  localStorage.setItem(LS_DEUCE, String(r.deuce));
+}
 
-  const resumeIfNeeded = async () => {
-    const ctx = audioCtxRef.current;
-    if (!ctx) return;
-    if (ctx.state === "suspended") {
-      try {
-        await ctx.resume();
-      } catch (_) {}
-    }
-  };
+// ===== Audio (unlock + fanfare) =====
+// 重要：iOS/Safari は「ユーザー操作」後に AudioContext を resume しないと無音になりやすい
+type AudioState = {
+  ctx: AudioContext | null;
+  master: GainNode | null;
+};
 
-  const playBeep = async () => {
-    const ctx = audioCtxRef.current;
-    if (!ctx) return;
-    await resumeIfNeeded();
+function createAudio(): AudioState {
+  const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+  if (!AudioCtx) return { ctx: null, master: null };
+
+  const ctx: AudioContext = new AudioCtx();
+  const master = ctx.createGain();
+  master.gain.value = 0.65;
+  master.connect(ctx.destination);
+
+  return { ctx, master };
+}
+
+async function ensureAudioUnlocked(audio: AudioState): Promise<boolean> {
+  if (!audio.ctx || !audio.master) return false;
+  try {
+    if (audio.ctx.state === "suspended") await audio.ctx.resume();
+    return audio.ctx.state === "running";
+  } catch {
+    return false;
+  }
+}
+
+function playTestBeep(audio: AudioState) {
+  if (!audio.ctx || !audio.master) return;
+  const ctx = audio.ctx;
+  const t0 = ctx.currentTime + 0.01;
+
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(0.16, t0 + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.18);
+  g.connect(audio.master);
+
+  const o1 = ctx.createOscillator();
+  o1.type = "sine";
+  o1.frequency.setValueAtTime(880, t0);
+  o1.connect(g);
+  o1.start(t0);
+  o1.stop(t0 + 0.18);
+
+  const o2 = ctx.createOscillator();
+  o2.type = "sine";
+  o2.frequency.setValueAtTime(1320, t0 + 0.20);
+  o2.connect(g);
+  o2.start(t0 + 0.20);
+  o2.stop(t0 + 0.38);
+}
+
+// ファンファーレ風：短い上昇アルペジオ + 和音 + トドメ
+function playFanfare(audio: AudioState) {
+  if (!audio.ctx || !audio.master) return;
+  const ctx = audio.ctx;
+  const t0 = ctx.currentTime + 0.02;
+
+  function tone(
+    freq: number,
+    start: number,
+    dur: number,
+    type: OscillatorType,
+    gainVal: number,
+    detune = 0
+  ) {
     const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.type = "sine";
-    osc.frequency.setValueAtTime(880, ctx.currentTime);
-    gain.gain.setValueAtTime(0.0001, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.01);
-    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.12);
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start();
-    osc.stop(ctx.currentTime + 0.14);
-  };
+    const g = ctx.createGain();
 
-  const playExplosion = async () => {
-    const ctx = audioCtxRef.current;
-    if (!ctx) return;
-    if (audioLockRef.current) return;
-    audioLockRef.current = true;
-    setTimeout(() => {
-      audioLockRef.current = false;
-    }, 300);
-    await resumeIfNeeded();
-    const duration = 1.1;
-    const buffer = ctx.createBuffer(
-      1,
-      Math.floor(ctx.sampleRate * duration),
-      ctx.sampleRate
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, start);
+    osc.detune.setValueAtTime(detune, start);
+
+    g.gain.setValueAtTime(0.0001, start);
+    g.gain.exponentialRampToValueAtTime(gainVal, start + 0.01);
+    g.gain.exponentialRampToValueAtTime(
+      Math.max(0.0001, gainVal * 0.35),
+      start + dur * 0.55
     );
-    const data = buffer.getChannelData(0);
-    for (let i = 0; i < data.length; i++) {
-      data[i] = (Math.random() * 2 - 1) * (1 - i / data.length);
+    g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+
+    osc.connect(g);
+    g.connect(audio.master!);
+
+    osc.start(start);
+    osc.stop(start + dur);
+  }
+
+  // Cメジャー
+  const C5 = 523.25;
+  const E5 = 659.25;
+  const G5 = 783.99;
+  const C6 = 1046.5;
+
+  const seq = [C5, E5, G5, C6, G5, C6];
+  seq.forEach((f, i) => {
+    const s = t0 + i * 0.085;
+    // ブラスっぽく：sawtooth を軽く detune して厚み
+    tone(f, s, 0.18, "sawtooth", 0.18, -6);
+    tone(f, s, 0.18, "sawtooth", 0.18, +6);
+    // 1オクターブ下を薄く
+    tone(f / 2, s, 0.20, "triangle", 0.06, 0);
+  });
+
+  const chordStart = t0 + seq.length * 0.085 + 0.02;
+  [C5, E5, G5, C6].forEach((f, j) => {
+    tone(f, chordStart, 0.55, "triangle", 0.10, j % 2 === 0 ? -4 : +4);
+  });
+
+  tone(C6, chordStart + 0.12, 0.65, "sine", 0.12, 0);
+}
+
+function computeWinner(L: number, R: number, rules: Rules): WinnerSide {
+  const t = rules.target;
+
+  if (!rules.deuce) {
+    if (L >= t) return "L";
+    if (R >= t) return "R";
+    return null;
+  }
+
+  // デュースあり：目標点以上 かつ 2点差
+  if ((L >= t || R >= t) && Math.abs(L - R) >= 2) {
+    return L > R ? "L" : "R";
+  }
+  return null;
+}
+
+export default function App() {
+  const [{ rules: initialRules, hasSaved }, setInit] = useState(() =>
+    loadRules()
+  );
+
+  const [rules, setRules] = useState<Rules>(initialRules);
+  const [L, setL] = useState(0);
+  const [R, setR] = useState(0);
+  const [winner, setWinner] = useState<WinnerSide>(null);
+
+  const [showReset, setShowReset] = useState(false);
+  const [showSettings, setShowSettings] = useState(!hasSaved);
+
+  // settings form
+  const [targetDraft, setTargetDraft] = useState<number>(initialRules.target);
+  const [deuceDraft, setDeuceDraft] = useState<boolean>(initialRules.deuce);
+
+  const audioRef = useRef<AudioState>(createAudio());
+
+  // long press
+  const LONG_PRESS_MS = 900;
+  const lpTimerRef = useRef<number | null>(null);
+  const suppressTapRef = useRef(false);
+
+  const ruleBadge = useMemo(
+    () => `目標${rules.target} / デュース${rules.deuce ? "あり" : "なし"}`,
+    [rules]
+  );
+
+  const vibrate = (ms: number | number[]) => {
+    try {
+      if (navigator.vibrate) navigator.vibrate(ms);
+    } catch {
+      // ignore
     }
-    const src = ctx.createBufferSource();
-    src.buffer = buffer;
-    const filter = ctx.createBiquadFilter();
-    filter.type = "lowpass";
-    filter.frequency.setValueAtTime(2200, ctx.currentTime);
-    filter.frequency.exponentialRampToValueAtTime(
-      200,
-      ctx.currentTime + duration
-    );
-    const gain = ctx.createGain();
-    gain.gain.setValueAtTime(0.001, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.9, ctx.currentTime + 0.03);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
-    src.connect(filter);
-    filter.connect(gain);
-    gain.connect(ctx.destination);
-    src.start();
-  };
-
-  useEffect(() => {
-    const onVisible = () => {
-      resumeIfNeeded();
-    };
-    window.addEventListener("visibilitychange", onVisible);
-    window.addEventListener("focus", onVisible);
-    return () => {
-      window.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("focus", onVisible);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!running || gameOver || isInfiniteTime) return;
-    const tick = () => {
-      const now = performance.now();
-      if (deadlineRef.current == null) return;
-      const left = deadlineRef.current - now;
-      setRemainingMs(Math.max(0, left));
-      const sec = ceilSecs(left);
-      if (sec !== lastSecondRef.current) {
-        lastSecondRef.current = sec;
-        if (sec <= 5 && sec > 0 && audioPrimed) {
-          try {
-            playBeep();
-          } catch (_) {}
-        }
-      }
-      if (left <= 0) {
-        setRunning(false);
-        setGameOver(true);
-        if (navigator.vibrate) {
-          try {
-            navigator.vibrate(800);
-          } catch (_) {}
-        }
-        if (audioPrimed) {
-          try {
-            playExplosion();
-          } catch (_) {}
-        }
-      }
-    };
-    const id = setInterval(tick, 100);
-    tick();
-    return () => clearInterval(id);
-  }, [running, gameOver, audioPrimed, isInfiniteTime]);
-
-  const triggerFlash = () => {
-    setFlash(true);
-    setTimeout(() => setFlash(false), 150);
-  };
-
-  const startGame = () => {
-    ensureAudioPrimed();
-    setStarted(true);
-    setGameOver(false);
-    setRunning(true);
-    setCurrentPlayer(0);
-    // ★ 初回手番の色適用
-    if (colorMode) setBgColor(pickRandomColor());
-    if (!isInfiniteTime) {
-      const now = performance.now();
-      deadlineRef.current = now + timePerTurn * 1000;
-      setRemainingMs(timePerTurn * 1000);
-      lastSecondRef.current = timePerTurn;
-    }
-  };
-
-  const finishTurn = () => {
-    if (!running || gameOver) return;
-    triggerFlash();
-    if (navigator.vibrate) {
-      try {
-        navigator.vibrate([30, 50, 30]);
-      } catch (_) {}
-    }
-    setCurrentPlayer((p) => {
-      const next = nextIdx(p, numPlayers);
-      if (!isInfiniteTime) {
-        const now = performance.now();
-        deadlineRef.current = now + timePerTurn * 1000;
-        setRemainingMs(timePerTurn * 1000);
-        lastSecondRef.current = timePerTurn;
-      }
-      // ★ 手番切替時の色適用
-      if (colorMode) setBgColor(pickRandomColor());
-      return next;
-    });
   };
 
   const resetAll = () => {
-    setRunning(false);
-    setGameOver(false);
-    setStarted(false);
-    setCurrentPlayer(0);
-    deadlineRef.current = null;
-    setRemainingMs(0);
-    lastSecondRef.current = null;
-    // ★ リセットで背景も戻す
-    setBgColor(undefined);
+    setL(0);
+    setR(0);
+    setWinner(null);
   };
 
-  const handleRootClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (
-      (e.target as HTMLElement).closest("#resetButton") ||
-      (e.target as HTMLElement).closest("#startButton") ||
-      (e.target as HTMLElement).closest("#colorModeToggle")
-    )
-      return; // ★ トグル操作はターン進行しない
-    ensureAudioPrimed();
-    if (started && running && !gameOver) finishTurn();
+  const flashSide = (side: "L" | "R") => {
+    const el = document.getElementById(side === "L" ? "halfL" : "halfR");
+    if (!el) return;
+    el.classList.remove("winflash");
+    // eslint-disable-next-line @typescript-eslint/no-unused-expressions
+    (el as any).offsetWidth; // reflow
+    el.classList.add("winflash");
+    window.setTimeout(() => el.classList.remove("winflash"), 3800);
   };
 
-  const resetHoldRef = useRef<{ timer: any; held: boolean }>({
-    timer: null,
-    held: false,
-  });
-  const onResetDown = (e: React.PointerEvent<HTMLButtonElement>) => {
-    e.stopPropagation();
-    const t = setTimeout(() => {
-      resetHoldRef.current.held = true;
-      resetAll();
-    }, 800);
-    resetHoldRef.current = { timer: t, held: false };
+  const celebrate = async (side: "L" | "R") => {
+    const audio = audioRef.current;
+    const ok = await ensureAudioUnlocked(audio);
+    if (ok) playFanfare(audio);
+    flashSide(side);
+    vibrate(40);
   };
-  const onResetUp = (e: React.PointerEvent<HTMLButtonElement>) => {
-    e.stopPropagation();
-    const { timer, held } = resetHoldRef.current || {};
-    if (timer) clearTimeout(timer);
-    resetHoldRef.current = { timer: null, held: false };
-    if (!held) {
-      if (started && running && !gameOver) finishTurn();
+
+  // winner evaluation after any score change
+  useEffect(() => {
+    const w = computeWinner(L, R, rules);
+    if (w && winner !== w) {
+      setWinner(w);
+      void celebrate(w);
+      return;
     }
+    if (!w && winner) {
+      setWinner(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [L, R, rules]);
+
+  // helpers
+  const incLeft = () => {
+    if (winner) return;
+    setL((v) => v + 1);
+    vibrate(10);
   };
+  const incRight = () => {
+    if (winner) return;
+    setR((v) => v + 1);
+    vibrate(10);
+  };
+
+  const decLeft = () => {
+    setL((v) => Math.max(0, v - 1));
+    vibrate(10);
+  };
+  const decRight = () => {
+    setR((v) => Math.max(0, v - 1));
+    vibrate(10);
+  };
+
+  const onSettingsOpen = async () => {
+    // 設定ボタン自体がユーザー操作なので、ここでアンロックを試みる
+    await ensureAudioUnlocked(audioRef.current);
+    setTargetDraft(rules.target);
+    setDeuceDraft(rules.deuce);
+    setShowSettings(true);
+  };
+
+  const onSettingsSave = () => {
+    const t = clampInt(Number(targetDraft), 1, 99);
+    const next: Rules = { target: t, deuce: !!deuceDraft };
+    setRules(next);
+    saveRules(next);
+    resetAll();
+    setShowSettings(false);
+  };
+
+  // Attach pointer handlers for tap/long-press on each half
+  const attachHalfHandlers = (side: "L" | "R") => {
+    const onPointerDown: React.PointerEventHandler<HTMLDivElement> = (e) => {
+      e.preventDefault();
+      suppressTapRef.current = false;
+      if (lpTimerRef.current) window.clearTimeout(lpTimerRef.current);
+      lpTimerRef.current = window.setTimeout(() => {
+        suppressTapRef.current = true;
+        setShowReset(true);
+        vibrate(40);
+      }, LONG_PRESS_MS);
+    };
+
+    const clear = () => {
+      if (lpTimerRef.current) {
+        window.clearTimeout(lpTimerRef.current);
+        lpTimerRef.current = null;
+      }
+    };
+
+    const onPointerUp: React.PointerEventHandler<HTMLDivElement> = (e) => {
+      e.preventDefault();
+      clear();
+      if (!suppressTapRef.current) {
+        side === "L" ? incLeft() : incRight();
+      }
+    };
+
+    const onPointerCancel: React.PointerEventHandler<HTMLDivElement> = () => {
+      clear();
+    };
+
+    const onContextMenu: React.MouseEventHandler<HTMLDivElement> = (e) => {
+      e.preventDefault();
+    };
+
+    return { onPointerDown, onPointerUp, onPointerCancel, onContextMenu };
+  };
+
+  const halfLHandlers = attachHalfHandlers("L");
+  const halfRHandlers = attachHalfHandlers("R");
+
+  // 初回ロードの hasSaved を再計算したい場合の保険（基本不要）
+  useEffect(() => {
+    setInit(loadRules());
+  }, []);
 
   return (
-    <div
-      className={`min-h-screen flex items-center justify-center p-6 select-none ${
-        flash ? "bg-yellow-100" : "bg-slate-50"
-      } text-slate-900 transition-colors duration-150`}
-      style={colorMode && !flash ? { backgroundColor: bgColor } : undefined} // ★ inline背景
-      onClick={handleRootClick}
-      onTouchStart={() => {
-        ensureAudioPrimed();
-        resumeIfNeeded();
-      }}
-      onMouseDown={() => {
-        ensureAudioPrimed();
-        resumeIfNeeded();
-      }}
-    >
-      <div className="w-full max-w-xl">
-        <div className="mb-4 text-center">
-          <h1 className="text-2xl font-bold tracking-tight">
-            Jenga Turn Timer
-          </h1>
-        </div>
+    <div style={styles.appRoot}>
+      {/* keyframes */}
+      <style>
+        {`
+          @keyframes winFlash {
+            0%   { background: rgba(0,255,130,.00); }
+            25%  { background: rgba(0,255,130,.18); }
+            50%  { background: rgba(0,255,130,.00); }
+            75%  { background: rgba(0,255,130,.22); }
+            100% { background: rgba(0,255,130,.00); }
+          }
+          .winflash::before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: transparent;
+            animation: winFlash 0.35s linear 0s 10;
+            pointer-events: none;
+          }
+        `}
+      </style>
 
-        {!started && (
-          <>
-            {/* ★ 追加: 色選択モードトグル（ゲーム開始前のみ表示） */}
-            <div
-              id="colorModeToggle"
-              className="mb-4 flex items-center justify-center gap-3"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <label className="inline-flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={colorMode}
-                  onChange={(e) => {
-                    setColorMode(e.target.checked);
-                    // ON にした瞬間、進行中なら即反映
-                    if (e.target.checked) setBgColor(pickRandomColor());
-                    else setBgColor(undefined);
-                  }}
-                  className="h-5 w-5"
-                />
-                <span className="text-sm font-medium">色選択モード</span>
-              </label>
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
-              <div className="bg-white rounded-2xl shadow p-4">
-                <label className="block text-sm font-medium mb-2">
-                  プレイヤー人数
-                </label>
-                <select
-                  className="w-full rounded-xl border px-3 py-3 text-lg"
-                  value={numPlayers}
-                  onChange={(e) => setNumPlayers(Number(e.target.value))}
-                >
-                  {[2, 3, 4].map((n) => (
-                    <option key={n} value={n}>
-                      {n} 人
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="bg-white rounded-2xl shadow p-4">
-                <label className="block text-sm font-medium mb-2">
-                  持ち時間（秒）
-                </label>
-                <select
-                  className="w-full rounded-xl border px-3 py-3 text-lg"
-                  value={timePerTurn}
-                  onChange={(e) => setTimePerTurn(Number(e.target.value))}
-                >
-                  {[5, 6, 7, 8, 9, 10, 15, 20, 25, 30].map((s) => (
-                    <option key={s} value={s}>
-                      {s} 秒
-                    </option>
-                  ))}
-                  <option value={Infinity}>∞</option>
-                </select>
-              </div>
-            </div>
-
-            <div className="flex items-center gap-4 justify-center">
-              <button
-                id="startButton"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  startGame();
-                }}
-                className="px-8 py-5 text-xl rounded-2xl shadow bg-emerald-600 text-white w-full sm:w-auto"
-              >
-                Start
-              </button>
-            </div>
-          </>
-        )}
-
-        {started && (
-          <div className="flex items-center gap-4 justify-center mb-4">
-            <button
-              id="resetButton"
-              onPointerDown={onResetDown}
-              onPointerUp={onResetUp}
-              onClick={(e) => e.stopPropagation()}
-              className="px-8 py-5 text-xl rounded-2xl shadow bg-slate-200 text-slate-800 w-full sm:w-auto"
-            >
-              Reset
-            </button>
-          </div>
-        )}
-
-        <div className="bg-white rounded-2xl shadow p-4 mb-4">
-          <div className="flex flex-col items-center">
-            {Array.from({ length: numPlayers }).map((_, i) => (
-              <input
-                key={i}
-                type="text"
-                className={`text-lg font-bold mb-2 text-center border rounded-lg px-3 py-2 ${
-                  i === currentPlayer && started && !gameOver
-                    ? "bg-blue-400"
-                    : "bg-slate-100"
-                } ${started ? "pointer-events-none" : ""}`}
-                value={playerNames[i]}
-                onChange={(e) => {
-                  const newNames = [...playerNames];
-                  newNames[i] = e.target.value;
-                  setPlayerNames(newNames);
-                }}
-                disabled={started}
-              />
-            ))}
+      <div style={styles.scoreArea}>
+        <div
+          id="halfL"
+          style={{
+            ...styles.half,
+            borderRight: "2px solid rgba(255,255,255,0.07)",
+          }}
+          {...halfLHandlers}
+        >
+          <div style={styles.label}>LEFT</div>
+          {winner === "L" && <div style={styles.winTag}>WIN</div>}
+          <div style={styles.score}>{L}</div>
+          <div style={styles.hint}>
+            <span>タップで +1 / 長押しでリセット</span>
+            <span style={styles.badge}>{ruleBadge}</span>
           </div>
         </div>
 
-        <div className="bg-white rounded-2xl shadow p-6 mb-4 text-center">
-          {gameOver ? (
-            <div className="text-4xl font-black text-rose-600">Game over</div>
-          ) : started ? (
-            isInfiniteTime ? (
-              <div className="text-6xl font-black">∞</div>
-            ) : (
-              <div className="text-6xl font-black tabular-nums">
-                {remainingSec}
-              </div>
-            )
-          ) : (
-            <div className="text-slate-400">Startを押すと開始します</div>
-          )}
+        <div id="halfR" style={styles.half} {...halfRHandlers}>
+          <div style={styles.label}>RIGHT</div>
+          {winner === "R" && <div style={styles.winTag}>WIN</div>}
+          <div style={styles.score}>{R}</div>
+          <div style={styles.hint}>
+            <span>タップで +1 / 長押しでリセット</span>
+            <span style={{ ...styles.badge, opacity: 0 }} aria-hidden>
+              _
+            </span>
+          </div>
         </div>
       </div>
+
+      <div style={styles.controls}>
+        <div style={styles.panel}>
+          <div style={styles.small}>左チーム</div>
+          <button style={{ ...styles.button, ...styles.minus }} onClick={decLeft}>
+            -1
+          </button>
+        </div>
+
+        <div style={{ ...styles.panel, justifyContent: "end" }}>
+          <div style={{ ...styles.small, textAlign: "right" }}>右チーム</div>
+          <button style={{ ...styles.button, ...styles.minus }} onClick={decRight}>
+            -1
+          </button>
+        </div>
+
+        <button style={{ ...styles.button, gridColumn: "1 / -1" }} onClick={onSettingsOpen}>
+          試合設定（目標点 / デュース）
+        </button>
+      </div>
+
+      {/* Reset confirm */}
+      {showReset && (
+        <div
+          style={styles.overlay}
+          onClick={(e) => e.target === e.currentTarget && setShowReset(false)}
+        >
+          <div style={styles.modal}>
+            <h2 style={styles.modalTitle}>リセットしますか？</h2>
+            <p style={styles.modalText}>両チームの点数を 0 に戻します。</p>
+            <div style={styles.modalActions}>
+              <button style={styles.button} onClick={() => setShowReset(false)}>
+                キャンセル
+              </button>
+              <button
+                style={{
+                  ...styles.button,
+                  borderColor: "rgba(255,80,80,.35)",
+                  background: "rgba(255,80,80,.22)",
+                }}
+                onClick={() => {
+                  resetAll();
+                  setShowReset(false);
+                }}
+              >
+                OK（リセット）
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Settings */}
+      {showSettings && (
+        <div
+          style={styles.overlay}
+          onClick={(e) => e.target === e.currentTarget && setShowSettings(false)}
+        >
+          <div style={styles.modal}>
+            <h2 style={styles.modalTitle}>試合設定</h2>
+            <p style={styles.modalText}>勝利条件を設定します。前回の設定が自動で入ります。</p>
+
+            <div style={styles.form}>
+              <div style={styles.row}>
+                <label style={styles.rowLabel} htmlFor="targetPoints">
+                  目標点（例：25 / 15 / 11）
+                </label>
+                <input
+                  id="targetPoints"
+                  style={styles.input}
+                  type="number"
+                  min={1}
+                  max={99}
+                  step={1}
+                  value={targetDraft}
+                  onChange={(e) => setTargetDraft(Number(e.target.value))}
+                />
+              </div>
+
+              <div style={styles.row}>
+                <label style={styles.rowLabel}>デュース</label>
+                <div style={styles.toggle}>
+                  <input
+                    type="checkbox"
+                    checked={deuceDraft}
+                    onChange={(e) => setDeuceDraft(e.target.checked)}
+                  />
+                  <span style={styles.rowLabel}>あり（2点差が必要）</span>
+                </div>
+              </div>
+
+              <button
+                style={{ ...styles.button, width: "100%" }}
+                onClick={async () => {
+                  const ok = await ensureAudioUnlocked(audioRef.current);
+                  if (ok) {
+                    playTestBeep(audioRef.current);
+                  } else {
+                    alert(
+                      "この環境では音がブロックされています（ミュート/ブラウザ制限の可能性）。"
+                    );
+                  }
+                }}
+              >
+                🔊 音を有効化（タップしてテスト）
+              </button>
+            </div>
+
+            <div style={styles.modalActions}>
+              <button style={styles.button} onClick={() => setShowSettings(false)}>
+                閉じる
+              </button>
+              <button style={styles.button} onClick={onSettingsSave}>
+                保存して開始
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
+
+const styles: Record<string, React.CSSProperties> = {
+  appRoot: {
+    height: "100vh",
+    width: "100%",
+    background: "#000",
+    color: "#fff",
+    display: "grid",
+    gridTemplateRows: "1fr auto",
+    fontFamily:
+      "system-ui, -apple-system, Segoe UI, Roboto, Noto Sans JP, sans-serif",
+    userSelect: "none",
+    WebkitTapHighlightColor: "transparent",
+  },
+  scoreArea: {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr",
+    gap: "2px",
+    background: "rgba(255,255,255,.06)",
+    minHeight: 0,
+  },
+  half: {
+    position: "relative",
+    display: "grid",
+    placeItems: "center",
+    background: "#000",
+    overflow: "hidden",
+    touchAction: "manipulation",
+  },
+  label: {
+    position: "absolute",
+    top: 10,
+    left: 12,
+    fontSize: 14,
+    opacity: 0.75,
+    letterSpacing: "0.08em",
+  },
+  score: {
+    fontSize: "clamp(96px, 18vw, 220px)",
+    fontWeight: 900,
+    lineHeight: 1,
+  },
+  hint: {
+    position: "absolute",
+    bottom: 10,
+    left: 12,
+    fontSize: 12,
+    opacity: 0.4,
+    display: "flex",
+    gap: 10,
+    alignItems: "baseline",
+    flexWrap: "wrap",
+  },
+  badge: {
+    border: "1px solid rgba(255,255,255,.18)",
+    background: "rgba(255,255,255,.10)",
+    padding: "2px 8px",
+    borderRadius: 999,
+    fontSize: 11,
+    opacity: 0.85,
+  },
+  controls: {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr",
+    gap: 10,
+    padding: 12,
+    background: "rgba(255,255,255,.04)",
+    borderTop: "1px solid rgba(255,255,255,.10)",
+  },
+  panel: {
+    display: "grid",
+    gridTemplateColumns: "1fr auto",
+    alignItems: "center",
+    gap: 8,
+  },
+  small: {
+    fontSize: 12,
+    opacity: 0.7,
+  },
+  button: {
+    appearance: "none",
+    border: "1px solid rgba(255,255,255,.18)",
+    background: "rgba(255,255,255,.12)",
+    color: "#fff",
+    borderRadius: 12,
+    padding: "10px 12px",
+    fontSize: 14,
+    fontWeight: 800,
+    cursor: "pointer",
+  },
+  minus: {
+    padding: "8px 10px",
+    fontSize: 13,
+    borderRadius: 10,
+    background: "rgba(255,80,80,.20)",
+  },
+  overlay: {
+    position: "fixed",
+    inset: 0,
+    display: "grid",
+    placeItems: "center",
+    background: "rgba(0,0,0,.62)",
+    padding: 20,
+    zIndex: 50,
+  },
+  modal: {
+    width: "min(460px, 92vw)",
+    border: "1px solid rgba(255,255,255,.18)",
+    background: "rgba(20,20,20,.95)",
+    borderRadius: 18,
+    padding: 16,
+    boxShadow: "0 16px 50px rgba(0,0,0,.55)",
+  },
+  modalTitle: {
+    margin: 0,
+    fontSize: 18,
+    fontWeight: 900,
+  },
+  modalText: {
+    margin: "8px 0 14px",
+    fontSize: 13,
+    opacity: 0.75,
+    lineHeight: 1.5,
+  },
+  modalActions: {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr",
+    gap: 10,
+  },
+  form: {
+    display: "grid",
+    gap: 10,
+    marginBottom: 14,
+  },
+  row: {
+    display: "grid",
+    gridTemplateColumns: "1fr auto",
+    alignItems: "center",
+    gap: 10,
+    padding: 10,
+    border: "1px solid rgba(255,255,255,.12)",
+    borderRadius: 14,
+    background: "rgba(255,255,255,.06)",
+  },
+  rowLabel: {
+    fontSize: 13,
+    opacity: 0.85,
+  },
+  input: {
+    width: 88,
+    padding: "8px 10px",
+    borderRadius: 12,
+    border: "1px solid rgba(255,255,255,.18)",
+    background: "rgba(0,0,0,.35)",
+    color: "#fff",
+    fontWeight: 900,
+    fontSize: 14,
+    outline: "none",
+  },
+  toggle: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+  },
+  winTag: {
+    position: "absolute",
+    top: 10,
+    right: 12,
+    fontSize: 12,
+    fontWeight: 900,
+    letterSpacing: "0.10em",
+    padding: "3px 10px",
+    borderRadius: 999,
+    border: "1px solid rgba(0,255,130,.35)",
+    background: "rgba(0,255,130,.14)",
+    color: "rgba(255,255,255,.92)",
+  },
+};
