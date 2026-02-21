@@ -212,8 +212,8 @@ export default function App() {
     const el = document.getElementById(side === "L" ? "halfL" : "halfR");
     if (!el) return;
     el.classList.remove("winflash");
-    // eslint-disable-next-line @typescript-eslint/no-unused-expressions
-    (el as any).offsetWidth; // reflow
+    const forceReflow = (el as HTMLElement).offsetWidth;
+    void forceReflow;
     el.classList.add("winflash");
     window.setTimeout(() => el.classList.remove("winflash"), 3800);
   };
@@ -237,7 +237,6 @@ export default function App() {
     if (!w && winner) {
       setWinner(null);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [L, R, rules]);
 
   // helpers
