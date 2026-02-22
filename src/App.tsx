@@ -39,28 +39,68 @@ function saveRules(r: Rules) {
 type AudioState = {
   ctx: AudioContext | null;
   master: GainNode | null;
+  htmlAudio: HTMLAudioElement | null;
+  unlocked: boolean;
 };
+
+const SILENT_WAV_DATA_URI =
+  "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
 
 function createAudio(): AudioState {
   const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-  if (!AudioCtx) return { ctx: null, master: null };
+  const htmlAudio = new Audio(SILENT_WAV_DATA_URI);
+  htmlAudio.preload = "auto";
+  htmlAudio.setAttribute("playsinline", "true");
+  htmlAudio.muted = false;
+
+  if (!AudioCtx) {
+    return { ctx: null, master: null, htmlAudio, unlocked: false };
+  }
 
   const ctx: AudioContext = new AudioCtx();
   const master = ctx.createGain();
   master.gain.value = 0.65;
   master.connect(ctx.destination);
 
-  return { ctx, master };
+  return { ctx, master, htmlAudio, unlocked: false };
 }
 
 async function ensureAudioUnlocked(audio: AudioState): Promise<boolean> {
-  if (!audio.ctx || !audio.master) return false;
-  try {
-    if (audio.ctx.state === "suspended") await audio.ctx.resume();
-    return audio.ctx.state === "running";
-  } catch {
-    return false;
+  if (audio.unlocked) return true;
+
+  let ctxUnlocked = false;
+
+  if (audio.ctx && audio.master) {
+    try {
+      if (audio.ctx.state === "suspended") await audio.ctx.resume();
+
+      // iOS PWA 向け: 無音バッファを一瞬再生して WebAudio の経路を温める
+      const src = audio.ctx.createBufferSource();
+      src.buffer = audio.ctx.createBuffer(1, 1, audio.ctx.sampleRate);
+      src.connect(audio.master);
+      src.start();
+      src.stop(audio.ctx.currentTime + 0.001);
+
+      ctxUnlocked = audio.ctx.state === "running" || audio.ctx.currentTime > 0;
+    } catch {
+      ctxUnlocked = false;
+    }
   }
+
+  let mediaUnlocked = false;
+  try {
+    if (audio.htmlAudio) {
+      audio.htmlAudio.currentTime = 0;
+      await audio.htmlAudio.play();
+      audio.htmlAudio.pause();
+      mediaUnlocked = true;
+    }
+  } catch {
+    mediaUnlocked = false;
+  }
+
+  audio.unlocked = ctxUnlocked || mediaUnlocked;
+  return audio.unlocked;
 }
 
 function playTestBeep(audio: AudioState) {
