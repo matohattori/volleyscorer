@@ -296,6 +296,7 @@ export default function App() {
   const attachHalfHandlers = (side: "L" | "R") => {
     const onPointerDown: React.PointerEventHandler<HTMLDivElement> = (e) => {
       e.preventDefault();
+      void ensureAudioUnlocked(audioRef.current);
       suppressTapRef.current = false;
       if (lpTimerRef.current) window.clearTimeout(lpTimerRef.current);
       lpTimerRef.current = window.setTimeout(() => {
@@ -543,6 +544,8 @@ const styles: Record<string, React.CSSProperties> = {
     fontFamily:
       "system-ui, -apple-system, Segoe UI, Roboto, Noto Sans JP, sans-serif",
     userSelect: "none",
+    WebkitUserSelect: "none",
+    WebkitTouchCallout: "none",
     WebkitTapHighlightColor: "transparent",
   },
   scoreArea: {
@@ -559,6 +562,8 @@ const styles: Record<string, React.CSSProperties> = {
     background: "#000",
     overflow: "hidden",
     touchAction: "manipulation",
+    WebkitUserSelect: "none",
+    WebkitTouchCallout: "none",
   },
   label: {
     position: "absolute",
@@ -572,6 +577,9 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: "clamp(96px, 18vw, 220px)",
     fontWeight: 900,
     lineHeight: 1,
+    userSelect: "none",
+    WebkitUserSelect: "none",
+    WebkitTouchCallout: "none",
   },
   hint: {
     position: "absolute",
